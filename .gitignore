@@ -1,0 +1,25 @@
+# Environment
+.venv/
+.claude/
+__pycache__/
+*.pyc
+
+# Binaries and Large Files
+*.apk
+*.zip
+*.exe
+*.task
+*.png
+
+# Sub-projects/Dependencies
+scrcpy/
+platform-tools/
+ros2/
+ros2_ws/
+Chords-Python/
+
+# Logs and Cache
+logs/
+calib_logs/
+cache/
+inventory.txt
