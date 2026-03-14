@@ -7,7 +7,7 @@ Connection: PC WiFi connected to drone's hotspot.
 
 # ── Network ──────────────────────────────────────────────────────────────────
 DRONE_IP   = '192.168.43.42'   # Default for drone softAP
-DRONE_PORT = 1234            # Matches localPort in firmware
+DRONE_PORT = 2390            # ESP-Drone CRTP UDP port
 
 # ── Thrust ───────────────────────────────────────────────────────────────────
 HOVER_THRUST     = 38000   # tune this first! increase until it lifts
