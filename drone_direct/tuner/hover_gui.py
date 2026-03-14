@@ -88,6 +88,38 @@ class PID:
         return max(-self.limit, min(self.limit, out))
 
 
+# ── Kalman filter for altitude ────────────────────────────────────────────────
+class KalmanHeight:
+    """
+    1-D Kalman filter with state = [altitude_m, velocity_m_s].
+    Fuses noisy Z measurements from solvePnP into a smooth height estimate
+    and suppresses camera jitter / momentary detection glitches.
+    """
+    def __init__(self, q_pos: float = 0.005, q_vel: float = 0.01,
+                 r_meas: float = 0.08):
+        self.x   = 0.0; self.v = 0.0          # state
+        self.P   = [[1.0, 0.0], [0.0, 1.0]]   # covariance
+        self.qp  = q_pos; self.qv = q_vel; self.r = r_meas
+
+    def step(self, z: float, dt: float) -> float:
+        dt = max(dt, 0.001)
+        # ── Predict ──────────────────────────────────────────────────────────
+        self.x  += self.v * dt
+        p00 = self.P[0][0] + dt*(self.P[1][0] + self.P[0][1]) + dt*dt*self.P[1][1] + self.qp
+        p01 = self.P[0][1] + dt * self.P[1][1]
+        p10 = self.P[1][0] + dt * self.P[1][1]
+        p11 = self.P[1][1] + self.qv
+        self.P  = [[p00, p01], [p10, p11]]
+        # ── Update ───────────────────────────────────────────────────────────
+        S   = self.P[0][0] + self.r
+        k0  = self.P[0][0] / S;  k1 = self.P[1][0] / S
+        inn = z - self.x
+        self.x += k0 * inn;  self.v += k1 * inn
+        self.P  = [[(1 - k0)*self.P[0][0], (1 - k0)*self.P[0][1]],
+                   [self.P[1][0] - k1*self.P[0][0], self.P[1][1] - k1*self.P[0][1]]]
+        return self.x
+
+
 # ── Camera stabiliser ─────────────────────────────────────────────────────────
 _SCRCPY_EXE = os.path.abspath(os.path.join(
     os.path.dirname(__file__), '..', '..', 'scrcpy',
@@ -106,9 +138,10 @@ class CameraStabilizer:
     S_UNAVAILABLE = "unavailable"
 
     MARKER_ID   = 7
-    MARKER_SIZE = 0.06   # metres (6 cm side)
+    MARKER_SIZE = 0.04   # metres — inner black square side (4 cm)
     EMA_ALPHA   = 0.25
-    DEAD_XY     = 0.02   # m  — ignore jitter below this
+    DEAD_XY     = 0.02   # m  — ignore lateral jitter below this
+    DEAD_Z      = 0.03   # m  — height dead-zone (3 cm)
     DEAD_YAW    = 5.0    # °
     MIN_STREAK  = 4      # consecutive frames before trusting detection
     HOLD_SECS   = 0.20   # keep last position this long after losing marker
@@ -117,6 +150,10 @@ class CameraStabilizer:
         self._lock         = threading.Lock()
         self._enabled      = True
         self._corr         = (0.0, 0.0, 0.0)   # roll, pitch, yaw corrections
+        self._height_enabled = False
+        self._target_height  = 1.0              # metres
+        self._height_corr    = 0.0              # thrust delta from height PID
+        self._current_height: Optional[float] = None
         self.status        = self.S_STARTING
         self._baseline_yaw: Optional[float] = None
         self._proc: Optional[subprocess.Popen] = None
@@ -137,12 +174,32 @@ class CameraStabilizer:
         with self._lock:
             self._enabled = v
             if not v:
-                self._corr = (0.0, 0.0, 0.0)
+                self._corr       = (0.0, 0.0, 0.0)
+                self._height_corr = 0.0
 
     def get_corrections(self) -> tuple:
         """Returns (roll, pitch, yaw) corrections — zeros when disabled."""
         with self._lock:
             return self._corr if self._enabled else (0.0, 0.0, 0.0)
+
+    def set_height_enabled(self, v: bool):
+        with self._lock:
+            self._height_enabled = v
+            if not v:
+                self._height_corr = 0.0
+
+    def set_target_height(self, h: float):
+        with self._lock:
+            self._target_height = max(0.10, h)
+
+    def get_height_correction(self) -> float:
+        """Thrust delta from height PID — zero when height hold is disabled."""
+        with self._lock:
+            return self._height_corr if (self._enabled and self._height_enabled) else 0.0
+
+    def get_current_height(self) -> Optional[float]:
+        with self._lock:
+            return self._current_height
 
     def _run(self):
         # Optional imports — fails gracefully if not installed
@@ -205,9 +262,14 @@ class CameraStabilizer:
         cam_matrix  = None
         dist_coeffs = np.zeros((4, 1), dtype=np.float32)
 
-        pid_roll  = PID(35.0, 1.0, 8.0, 20.0)
-        pid_pitch = PID(35.0, 1.0, 8.0, 20.0)
-        pid_yaw   = PID(15.0, 0.0, 1.5, 80.0)
+        pid_roll   = PID(35.0, 1.0,   8.0,  20.0)
+        pid_pitch  = PID(35.0, 1.0,   8.0,  20.0)
+        pid_yaw    = PID(15.0, 0.0,   1.5,  80.0)
+        # Height-hold PID: error in metres → thrust correction units
+        # kp=5000 → 1 m off ≈ ±5000 thrust;  kd damps vertical oscillation
+        pid_thrust = PID(5000.0, 200.0, 1500.0, 12000.0)
+        kf_height  = KalmanHeight(q_pos=0.005, q_vel=0.01, r_meas=0.08)
+        last_kf_t  = time.time()
 
         smooth_pos    = None
         last_det_t    = 0.0
@@ -306,25 +368,43 @@ class CameraStabilizer:
                     smooth_pos    = None
 
             if detected:
-                x_m, y_m, _, yaw_raw = detected
+                x_m, y_m, z_m, yaw_raw = detected
                 if self._baseline_yaw is None:
                     self._baseline_yaw = yaw_raw
-                    pid_roll.reset(); pid_pitch.reset(); pid_yaw.reset()
+                    pid_roll.reset(); pid_pitch.reset()
+                    pid_yaw.reset();  pid_thrust.reset()
 
+                # ── Lateral + yaw corrections ─────────────────────────────
                 baseline: float = self._baseline_yaw  # type: ignore[assignment]
                 dx   = x_m if abs(x_m) > self.DEAD_XY else 0.0
                 dy   = y_m if abs(y_m) > self.DEAD_XY else 0.0
                 tilt = float((yaw_raw - baseline + 180) % 360 - 180)
                 tilt = float(tilt if abs(tilt) > self.DEAD_YAW else 0.0)
 
+                # ── Height: Kalman-filter Z then run PID ──────────────────
+                now_kf      = time.time()
+                h_filtered  = kf_height.step(z_m, now_kf - last_kf_t)
+                last_kf_t   = now_kf
                 with self._lock:
-                    self._corr = (pid_roll.compute(-dx),
-                                  pid_pitch.compute(dy),
-                                  pid_yaw.compute(-tilt))
+                    target_h = self._target_height
+                    h_en     = self._height_enabled
+                h_err        = target_h - h_filtered
+                h_corr       = pid_thrust.compute(h_err) if h_en else 0.0
+                if h_en and abs(h_err) < self.DEAD_Z:
+                    h_corr = 0.0
+
+                with self._lock:
+                    self._corr           = (pid_roll.compute(-dx),
+                                            pid_pitch.compute(dy),
+                                            pid_yaw.compute(-tilt))
+                    self._height_corr    = h_corr
+                    self._current_height = h_filtered
                 self.status = self.S_ACTIVE
             else:
                 with self._lock:
-                    self._corr = (0.0, 0.0, 0.0)
+                    self._corr           = (0.0, 0.0, 0.0)
+                    self._height_corr    = 0.0
+                    self._current_height = None
                 if self.status == self.S_ACTIVE:
                     self.status        = self.S_NO_LOCK
                     self._baseline_yaw = None
@@ -407,9 +487,9 @@ class DroneLink(threading.Thread):
     def _ramp_arm(self):
         self._send(0, 0, 0, 0)
         time.sleep(cfg.UNLOCK_DURATION)
-        steps  = max(10, int(cfg.THRUST_RAMP_TIME * cfg.SEND_HZ))
-        target = cfg.HOVER_THRUST
+        steps = max(10, int(cfg.THRUST_RAMP_TIME * cfg.SEND_HZ))
         with self._lock:
+            target       = max(cfg.THRUST_MIN, self._thrust)  # honour slider
             self._thrust = 0
             self._armed  = True
         for i in range(steps):
@@ -434,28 +514,35 @@ class DroneLink(threading.Thread):
 
     def run(self):
         interval = 1.0 / cfg.SEND_HZ
-        cur_r, cur_p, cur_y = 0.0, 0.0, 0.0
+        cur_r, cur_p, cur_y, cur_t = 0.0, 0.0, 0.0, 0.0
         while self._running:
             cam_r = cam_p = cam_y = 0.0
+            h_corr = 0.0
             if self._cam_stab:
                 cam_r, cam_p, cam_y = self._cam_stab.get_corrections()
+                h_corr = self._cam_stab.get_height_correction()
 
             with self._lock:
                 armed  = self._armed
                 emerg  = self._emergency
-                tgt_t  = float(self._thrust)
+                base_t = float(self._thrust)
                 # Permanent trim  +  key offset  +  camera correction
                 tgt_r  = self._roll  + self._key_r + cam_r
                 tgt_p  = self._pitch + self._key_p + cam_p
                 tgt_y  = self._yaw   + self._key_y + cam_y
                 smooth = 0.25 if self._stabilize else 0.08
 
+            # Height PID adds to base thrust; clamp to safe range
+            tgt_t = float(max(cfg.THRUST_MIN,
+                              min(cfg.THRUST_MAX, base_t + h_corr)))
+
             cur_r += (tgt_r - cur_r) * smooth
             cur_p += (tgt_p - cur_p) * smooth
             cur_y += (tgt_y - cur_y) * smooth
+            cur_t += (tgt_t - cur_t) * 0.15   # smooth thrust changes
 
             if armed and not emerg:
-                self._send(cur_r, cur_p, cur_y, int(tgt_t))
+                self._send(cur_r, cur_p, cur_y, int(cur_t))
             else:
                 self._send(0, 0, 0, 0)
             time.sleep(interval)
@@ -472,7 +559,7 @@ class DroneLink(threading.Thread):
 # ── Vertical slider with label + spinbox ─────────────────────────────────────
 class ParamSlider(QWidget):
     def __init__(self, title, min_v, max_v, default, scale=1.0,
-                 unit='', decimals=0, color='#00bcd4', desc=''):
+                 unit='', decimals=0, color='#00bcd4', desc='', step=None):
         super().__init__()
         self.scale    = scale
         self.decimals = decimals
@@ -502,6 +589,11 @@ class ParamSlider(QWidget):
         self.slider.setRange(min_v, max_v)
         self.slider.setValue(default)
         self.slider.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        if step is not None:
+            self.slider.setSingleStep(step)
+            self.slider.setPageStep(step * 10)
+            self.slider.setTickInterval(step * 10)
+            self.slider.setTickPosition(QSlider.TicksRight)
         self.slider.setStyleSheet(f"""
             QSlider::groove:vertical {{
                 background:#1e1e2e; width:10px; border-radius:5px;
@@ -516,7 +608,7 @@ class ParamSlider(QWidget):
         """)
         self.slider.valueChanged.connect(self._on_slider)
 
-        spin_step = 1000.0 if decimals == 0 else scale
+        spin_step = (step * scale) if step is not None else (1000.0 if decimals == 0 else scale)
         self.spinbox = QDoubleSpinBox()
         self.spinbox.setRange(min_v * scale, max_v * scale)
         self.spinbox.setSingleStep(spin_step)
@@ -625,12 +717,12 @@ class TunerWindow(QMainWindow):
         ll.setSpacing(16)
         self.sl_thrust = ParamSlider(
             "Throttle", cfg.THRUST_MIN, cfg.THRUST_MAX, cfg.HOVER_THRUST,
-            color='#ff6b6b',
+            color='#ff6b6b', step=100,
             desc="Base motor power. W = up, S = down while flying."
         )
         self.sl_yaw = ParamSlider(
-            "Yaw trim", -300, 300, int(cfg.TRIM_YAW * 10),
-            scale=0.1, unit='°/s', decimals=1, color='#845ef7',
+            "Yaw trim", -30000, 30000, int(cfg.TRIM_YAW * 1000),
+            scale=0.001, unit='°/s', decimals=4, color='#845ef7',
             desc="Permanent spin correction. A/D keys = yaw while flying."
         )
         for s in (self.sl_thrust, self.sl_yaw):
@@ -643,13 +735,13 @@ class TunerWindow(QMainWindow):
         rl = QHBoxLayout(rg)
         rl.setSpacing(16)
         self.sl_pitch = ParamSlider(
-            "Pitch trim", -200, 200, int(cfg.TRIM_PITCH * 10),
-            scale=0.1, unit='°', decimals=1, color='#6bcb77',
+            "Pitch trim", -20000, 20000, int(cfg.TRIM_PITCH * 1000),
+            scale=0.001, unit='°', decimals=4, color='#6bcb77',
             desc="Permanent fwd/back correction. Arrow Up/Down = pitch while flying."
         )
         self.sl_roll = ParamSlider(
-            "Roll trim", -200, 200, int(cfg.TRIM_ROLL * 10),
-            scale=0.1, unit='°', decimals=1, color='#ffd93d',
+            "Roll trim", -20000, 20000, int(cfg.TRIM_ROLL * 1000),
+            scale=0.001, unit='°', decimals=4, color='#ffd93d',
             desc="Permanent left/right correction. Arrow Left/Right = roll while flying."
         )
         for s in (self.sl_pitch, self.sl_roll):
@@ -694,6 +786,40 @@ class TunerWindow(QMainWindow):
                   self.btn_save, self.chk_gyro, self.chk_cam):
             bl.addWidget(w)
         v.addWidget(bg)
+
+        # ── Height Hold ───────────────────────────────────────────────────
+        hg = QGroupBox("HEIGHT HOLD  —  ArUco Z from camera (requires camera lock)")
+        hl = QHBoxLayout(hg)
+        hl.setSpacing(12)
+
+        self.chk_height = QCheckBox("Enable")
+        self.chk_height.setStyleSheet('color:#4fc3f7; font-size:11px; padding:6px;')
+        self.chk_height.setToolTip(
+            "PID controller keeps drone at the target height using the\n"
+            "ArUco marker Z distance. Kalman filter suppresses camera jitter.\n"
+            "Requires camera lock (marker visible).")
+        self.chk_height.stateChanged.connect(
+            lambda s: self.cam_stab.set_height_enabled(bool(s)))
+
+        # Target height 0.20 m – 3.00 m, 1 cm resolution
+        self.sl_height = ParamSlider(
+            "Target Height", 20, 300, 100,
+            scale=0.01, unit=' m', decimals=4, color='#4fc3f7',
+            desc="Hold the drone at this height above the camera."
+        )
+        self.sl_height.slider.valueChanged.connect(
+            lambda raw: self.cam_stab.set_target_height(raw * 0.01))
+        self.sl_height.spinbox.valueChanged.connect(
+            lambda val: self.cam_stab.set_target_height(val))
+
+        self.lbl_height = QLabel("Height: --")
+        self.lbl_height.setFont(QFont('Segoe UI', 11, QFont.Bold))
+        self.lbl_height.setStyleSheet('color:#4fc3f7; padding:4px; min-width:130px;')
+
+        hl.addWidget(self.chk_height)
+        hl.addWidget(self.sl_height, stretch=1)
+        hl.addWidget(self.lbl_height)
+        v.addWidget(hg)
 
         self.status = QLabel("DISARMED")
         self.status.setFont(QFont('Segoe UI', 12, QFont.Bold))
@@ -763,7 +889,7 @@ class TunerWindow(QMainWindow):
         #   Right stick (arrows)—  Up/Down = pitch,  Left/Right = roll
         STEP_ATT    = 5.0    # degrees per 20 ms tick
         STEP_YAW    = 15.0   # deg/s per tick
-        STEP_THRUST = 300    # thrust units per tick
+        STEP_THRUST = 100    # thrust units per tick
 
         r = p = y = 0.0
         dt = 0
@@ -794,9 +920,9 @@ class TunerWindow(QMainWindow):
             text = f.read()
         vals = {
             'HOVER_THRUST': int(self.sl_thrust.value()),
-            'TRIM_ROLL':    round(self.sl_roll.value(),  1),
-            'TRIM_PITCH':   round(self.sl_pitch.value(), 1),
-            'TRIM_YAW':     round(self.sl_yaw.value(),   1),
+            'TRIM_ROLL':    round(self.sl_roll.value(),  4),
+            'TRIM_PITCH':   round(self.sl_pitch.value(), 4),
+            'TRIM_YAW':     round(self.sl_yaw.value(),   4),
         }
         for key, val in vals.items():
             text = re.sub(rf'^({re.escape(key)}\s*=\s*)\S+',
@@ -805,9 +931,9 @@ class TunerWindow(QMainWindow):
             f.write(text)
         self.status.setText(
             f"Saved — Thrust:{vals['HOVER_THRUST']}  "
-            f"R:{vals['TRIM_ROLL']:+.1f}  "
-            f"P:{vals['TRIM_PITCH']:+.1f}  "
-            f"Y:{vals['TRIM_YAW']:+.1f}")
+            f"R:{vals['TRIM_ROLL']:+.4f}  "
+            f"P:{vals['TRIM_PITCH']:+.4f}  "
+            f"Y:{vals['TRIM_YAW']:+.4f}")
 
     def _get_mtime(self):
         try:
@@ -837,6 +963,11 @@ class TunerWindow(QMainWindow):
         armed = self.drone.is_armed
         emerg = self.drone.is_emergency
         thr   = int(self.sl_thrust.value())
+
+        # Live height readout
+        h = self.cam_stab.get_current_height()
+        self.lbl_height.setText(
+            f"Height: {h:.4f} m" if h is not None else "Height: --")
 
         # Update camera stabilise checkbox label/colour with live status
         cs = self.cam_stab.status
