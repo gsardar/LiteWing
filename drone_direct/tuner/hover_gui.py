@@ -22,6 +22,7 @@ Run:
   python hover_gui.py
 """
 
+import importlib.util
 import math
 import os
 import socket
@@ -33,10 +34,26 @@ import time
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(__file__))
-import config as cfg
+
+# ── Multi-drone config support ────────────────────────────────────────────────
+_DRONE_CONFIGS = {
+    'Drone 2  (config three)': 'config three',
+    'Drone 1  (config 4)':     'config 4',
+}
+
+def _load_config_file(filename: str):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename + '.py')
+    spec = importlib.util.spec_from_file_location('_active_drone_cfg', path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load config: {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod
+
+cfg = _load_config_file('config three')   # default — Drone 2
 
 from PyQt5.QtWidgets import (
-    QApplication, QCheckBox, QDoubleSpinBox, QGroupBox, QHBoxLayout,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QGroupBox, QHBoxLayout,
     QLabel, QMainWindow, QPushButton, QSizePolicy, QSlider, QVBoxLayout,
     QWidget,
 )
@@ -425,6 +442,7 @@ class DroneLink(threading.Thread):
         self._pitch     = cfg.TRIM_PITCH
         self._yaw       = cfg.TRIM_YAW
         self._running   = True
+        self._landing   = False
         # Transient key offsets (return to 0 on key release)
         self._key_r     = 0.0
         self._key_p     = 0.0
@@ -465,10 +483,19 @@ class DroneLink(threading.Thread):
     def disarm(self):
         threading.Thread(target=self._ramp_disarm, daemon=True).start()
 
+    def soft_land(self):
+        threading.Thread(target=self._soft_land_thread, daemon=True).start()
+
+    @property
+    def is_landing(self):
+        with self._lock:
+            return self._landing
+
     def emergency(self):
         with self._lock:
             self._emergency = True
             self._armed     = False
+            self._landing   = False
 
     def clear_emergency(self):
         with self._lock:
@@ -511,6 +538,38 @@ class DroneLink(threading.Thread):
         with self._lock:
             self._thrust = 0
             self._armed  = False
+
+    def _soft_land_thread(self):
+        """Deceleration-curve descent: ~5 s, front-loaded thrust drop then disarm.
+
+        Uses a power curve (progress ** CURVE) where CURVE < 1 causes thrust to
+        fall quickly at first and taper off near the ground:
+          progress=25% → ~56% thrust remaining  (linear would be 75%)
+          progress=50% → ~29% thrust remaining  (linear would be 50%)
+          progress=75% → ~10% thrust remaining  (linear would be 25%)
+        """
+        LAND_SECS  = 3
+        LAND_STEPS = 100
+        LAND_CURVE = 0.60   # < 1 = front-loaded deceleration; 1.0 = linear
+        with self._lock:
+            if not self._armed or self._emergency:
+                return
+            self._landing = True
+            from_t = self._thrust
+        delay = LAND_SECS / LAND_STEPS
+        for i in range(LAND_STEPS):
+            with self._lock:
+                if self._emergency:
+                    self._landing = False
+                    return
+                progress = (i + 1) / LAND_STEPS
+                self._thrust = max(0,
+                    int(from_t * (1 - progress ** LAND_CURVE)))
+            time.sleep(delay)
+        with self._lock:
+            self._thrust  = 0
+            self._armed   = False
+            self._landing = False
 
     def run(self):
         interval = 1.0 / cfg.SEND_HZ
@@ -675,7 +734,8 @@ class TunerWindow(QMainWindow):
         self._hot.timeout.connect(self._hot_reload)
         self._hot.start(500)
 
-        self._pressed   = set()
+        self._pressed        = set()
+        self._key_hold_start = {}   # key → timestamp when first pressed
         self._key_timer = QTimer()
         self._key_timer.timeout.connect(self._apply_keys)
         self._key_timer.start(20)   # 50 Hz key polling
@@ -759,6 +819,7 @@ class TunerWindow(QMainWindow):
         bl.setSpacing(10)
 
         self.btn_arm  = self._btn("ARM",         '#22aa55', self._arm_toggle, h=50)
+        self.btn_land = self._btn("Soft Land",   '#e67e00', self._soft_land,  h=50)
         self.btn_emrg = self._btn("EMERGENCY",   '#dd3333', self._emergency,  h=50)
         self.btn_rst  = self._btn("Reset Trims", '#2a2a3e', self._reset,      h=50)
         self.btn_save = self._btn("Save config", '#1a3a5c', self._save,       h=50)
@@ -782,7 +843,7 @@ class TunerWindow(QMainWindow):
         self.chk_cam.stateChanged.connect(
             lambda s: self.cam_stab.set_enabled(bool(s)))
 
-        for w in (self.btn_arm, self.btn_emrg, self.btn_rst,
+        for w in (self.btn_arm, self.btn_land, self.btn_emrg, self.btn_rst,
                   self.btn_save, self.chk_gyro, self.chk_cam):
             bl.addWidget(w)
         v.addWidget(bg)
@@ -848,6 +909,10 @@ class TunerWindow(QMainWindow):
             return
         self.drone.disarm() if self.drone.is_armed else self.drone.arm()
 
+    def _soft_land(self):
+        if self.drone.is_armed and not self.drone.is_emergency:
+            self.drone.soft_land()
+
     def _emergency(self):
         if self.drone.is_emergency:
             self.drone.clear_emergency()
@@ -870,10 +935,12 @@ class TunerWindow(QMainWindow):
     def keyPressEvent(self, event):
         if not event.isAutoRepeat():
             self._pressed.add(event.key())
+            self._key_hold_start[event.key()] = time.time()
 
     def keyReleaseEvent(self, event):
         if not event.isAutoRepeat():
             self._pressed.discard(event.key())
+            self._key_hold_start.pop(event.key(), None)
 
     def _apply_keys(self):
         # Don't steal keys while user is typing in a spinbox
@@ -887,13 +954,17 @@ class TunerWindow(QMainWindow):
         # Mode 2 RC:
         #   Left stick  (WASD)  —  W/S = throttle,    A/D = yaw
         #   Right stick (arrows)—  Up/Down = pitch,  Left/Right = roll
-        STEP_ATT    = 5.0    # degrees per 20 ms tick
-        STEP_YAW    = 15.0   # deg/s per tick
-        STEP_THRUST = 100    # thrust units per tick
+        STEP_ATT       = 5.0    # degrees per 20 ms tick
+        STEP_YAW       = 15.0   # deg/s per tick
+        # Joystick-style throttle: starts slow, accelerates while held
+        THRUST_MIN_RATE = 50    # thrust/tick on first press  (fine trim)
+        THRUST_MAX_RATE = 600   # thrust/tick after 1.5 s hold (fast climb)
+        THRUST_ACCEL_T  = 1.5   # seconds to reach max rate
 
         r = p = y = 0.0
         dt = 0
 
+        now = time.time()
         for k in self._pressed:
             if k == Qt.Key_Left:  r -= STEP_ATT
             if k == Qt.Key_Right: r += STEP_ATT
@@ -901,8 +972,12 @@ class TunerWindow(QMainWindow):
             if k == Qt.Key_Down:  p += STEP_ATT
             if k == Qt.Key_A:     y -= STEP_YAW
             if k == Qt.Key_D:     y += STEP_YAW
-            if k == Qt.Key_W:     dt += STEP_THRUST
-            if k == Qt.Key_S:     dt -= STEP_THRUST
+            if k in (Qt.Key_W, Qt.Key_S):
+                hold = now - self._key_hold_start.get(k, now)
+                ratio = min(1.0, hold / THRUST_ACCEL_T)
+                step = int(THRUST_MIN_RATE + ratio * (THRUST_MAX_RATE - THRUST_MIN_RATE))
+                if k == Qt.Key_W: dt += step
+                else:             dt -= step
 
         if dt:
             new_t = max(cfg.THRUST_MIN,
@@ -960,9 +1035,18 @@ class TunerWindow(QMainWindow):
             self.status.setText(f"Reload error: {e}")
 
     def _refresh(self):
-        armed = self.drone.is_armed
-        emerg = self.drone.is_emergency
-        thr   = int(self.sl_thrust.value())
+        armed   = self.drone.is_armed
+        emerg   = self.drone.is_emergency
+        landing = self.drone.is_landing
+        thr     = int(self.sl_thrust.value())
+
+        # Sync throttle slider with the live thrust during soft-landing
+        if landing:
+            with self.drone._lock:
+                live_t = self.drone._thrust
+            self.sl_thrust.blockSignals(True)
+            self.sl_thrust.set_value(live_t)
+            self.sl_thrust.blockSignals(False)
 
         # Live height readout
         h = self.cam_stab.get_current_height()
@@ -993,6 +1077,21 @@ class TunerWindow(QMainWindow):
                 'background:#3a1111; border-radius:8px; color:#ff6b6b; padding:4px;')
             self.btn_arm.setStyleSheet(
                 'background:#2a2a2a; color:#444; border-radius:8px;')
+            self.btn_land.setEnabled(False)
+            self.btn_land.setStyleSheet(
+                'background:#2a2a2a; color:#444; border-radius:8px;')
+        elif landing:
+            with self.drone._lock:
+                live_t = self.drone._thrust
+            self.status.setText(f"LANDING  —  Throttle: {live_t}")
+            self.status.setStyleSheet(
+                'background:#2a1a00; border-radius:8px; color:#e67e00; padding:4px;')
+            self.btn_arm.setText("DISARM")
+            self.btn_arm.setStyleSheet(
+                'background:#cc3333; color:white; border-radius:8px;')
+            self.btn_land.setEnabled(False)
+            self.btn_land.setStyleSheet(
+                'background:#2a2a2a; color:#444; border-radius:8px;')
         elif armed:
             self.status.setText(f"ARMED   Throttle: {thr}")
             self.status.setStyleSheet(
@@ -1000,6 +1099,9 @@ class TunerWindow(QMainWindow):
             self.btn_arm.setText("DISARM")
             self.btn_arm.setStyleSheet(
                 'background:#cc3333; color:white; border-radius:8px;')
+            self.btn_land.setEnabled(True)
+            self.btn_land.setStyleSheet(
+                'background:#e67e00; color:white; border-radius:8px;')
         else:
             self.status.setText("DISARMED  —  press ARM to begin")
             self.status.setStyleSheet(
@@ -1007,6 +1109,9 @@ class TunerWindow(QMainWindow):
             self.btn_arm.setText("ARM")
             self.btn_arm.setStyleSheet(
                 'background:#22aa55; color:white; border-radius:8px;')
+            self.btn_land.setEnabled(False)
+            self.btn_land.setStyleSheet(
+                'background:#2a2a2a; color:#444; border-radius:8px;')
 
     def closeEvent(self, event):
         if self.drone.is_armed:

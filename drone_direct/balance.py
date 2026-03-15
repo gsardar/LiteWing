@@ -59,7 +59,7 @@ CAM_FACING     = 'back' # 'back' or 'front'
 
 
 # ── ArUco marker ──────────────────────────────────────────────────────────────
-MARKER_SIZE_M   = 0.08        # physical marker side length in metres
+MARKER_SIZE_M   = 0.04        # inner black square side length in metres (4 cm)
 DRONE_MARKER_ID = 7           # which ArUco ID is on the drone
 
 # ── PID gains ─────────────────────────────────────────────────────────────────

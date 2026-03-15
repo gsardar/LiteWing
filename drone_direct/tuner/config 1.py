@@ -10,7 +10,7 @@ DRONE_IP   = '192.168.43.42'   # Default for drone softAP
 DRONE_PORT = 2390            # ESP-Drone CRTP UDP port
 
 # ── Thrust ───────────────────────────────────────────────────────────────────
-HOVER_THRUST     = 33000   # tune this first! increase until it lifts
+HOVER_THRUST     = 49550   # tune this first! increase until it lifts
 THRUST_RAMP_TIME = 2.0     # seconds to ramp 0 -> HOVER_THRUST on arm
 THRUST_MIN       = 10000   # safety floor
 THRUST_MAX       = 60000   # safety ceiling
@@ -23,8 +23,8 @@ DESCENT_SECS     = 2.5
 # ── Attitude trim (degrees) ──────────────────────────────────────────────────
 # Positive roll  → tilts right   Negative → left
 # Positive pitch → tilts forward  Negative → backward
-TRIM_ROLL  = 4.66
-TRIM_PITCH = -0.293
+TRIM_ROLL  = 6.325
+TRIM_PITCH = 0.885
 TRIM_YAW   = 0.0    # degrees/s
 
 # ── Packet rate ───────────────────────────────────────────────────────────────

@@ -53,12 +53,19 @@ MARKER_SIZE_M   = 0.04        # 4 cm
 # We will lock onto the FIRST marker we see if None, or force an ID here.
 DRONE_MARKER_ID = None        
 
-# ── Flight Params ─────────────────────────────────────────────────────────────
-IDLE_THRUST   = 30000         # Base thrust when armed but Z < 0.4m (props spin, safe to hold)
-HOVER_SEARCH  = 42000         # Conservative starting thrust when PIDs engage (below hover)
+# ── Flight Params — initial values pulled from tuner/config.py ───────────────
+# Edit config.py to change these; fly_ground_cam picks them up automatically.
+HOVER_SEARCH       = cfg.HOVER_THRUST    # Starting hover reference (config: HOVER_THRUST)
+TAKEOFF_RAMP_TIME  = cfg.THRUST_RAMP_TIME  # Seconds to ramp 0 → hover thrust
+TAKEOFF_MAX_THRUST = cfg.HOVER_THRUST    # Ramp to hover thrust — matches hover_gui behaviour
+
+# Launch-catch: on ACTIVE entry, hold sub-hover thrust to bleed upward momentum
+# before handing off to PID. Prevents the drone rocketing to the ceiling.
+LAUNCH_THRUST = int(cfg.HOVER_THRUST * 0.88)  # ~88% of hover — sub-hover to brake climb
+LAUNCH_SECS   = 2.0                           # Catch phase duration (seconds)
 
 # Adaptive Hover Thrust Learning
-# The real hover thrust is unknown. We start at HOVER_SEARCH and slowly ramp
+# The real hover thrust is unknown. We start at cfg.HOVER_THRUST and slowly ramp
 # up/down by watching whether the drone is consistently above or below target.
 # ADAPT_ALPHA  : learning rate (0 = never changes, 1 = tracks instantly)
 # ADAPT_THRESH : min average correction to trigger a base update
@@ -66,8 +73,8 @@ HOVER_SEARCH  = 42000         # Conservative starting thrust when PIDs engage (b
 ADAPT_ALPHA  = 0.003          # very conservative
 ADAPT_THRESH = 1000           # units of thrust
 ADAPT_MAX    = 2000           # units of thrust per nudge
-HOVER_MIN    = 25000
-HOVER_MAX    = 62000
+HOVER_MIN    = cfg.THRUST_MIN
+HOVER_MAX    = cfg.THRUST_MAX
 
 HANDOVER_Z  = 0.40            # Altitude (m) where PIDs take over from Idle
 CEILING_Z   = 1.20            # Hard ceiling (m) — thrust reduced if exceeded
@@ -75,7 +82,7 @@ CEILING_Z   = 1.20            # Hard ceiling (m) — thrust reduced if exceeded
 # ── Safety boundary ───────────────────────────────────────────────────────────
 # If the marker pixel position moves outside this fraction of the frame from
 # center, motors are KILLED immediately (drone drifted too far away).
-BOUNDARY_FRAC = 0.60          # 60 % of frame width/height from center
+BOUNDARY_FRAC = 1          # 60 % of frame width/height from center
 
 # ── PID gains (Ground Cam Perspective) ────────────────────────────────────────
 PID_ROLL_KP,  PID_ROLL_KI,  PID_ROLL_KD  = 35.0,  1.0,   8.0
@@ -97,14 +104,20 @@ HOLD_SECS  = 1.5              # Max time to fly blind — 1.5s to survive vibrat
 MIN_STREAK  = 10              # Frames needed for ACCURATE pose used by ACTIVE PIDs
 IDLE_STREAK = 2               # Frames needed to confirm drone is there before spinning IDLE props
 
-# ESC unlock duration: ESP-Drone ESC requires zero-thrust packets for ~2s
-# before it will accept a new arm command (matches spin_test.py behaviour)
-ESC_UNLOCK_SECS = 2.0
+# ESC unlock duration — pulled from config.py (UNLOCK_DURATION)
+ESC_UNLOCK_SECS = cfg.UNLOCK_DURATION
 
 # ── Ceiling brake zone ────────────────────────────────────────────────────────────
 # From CEILING_WARN_Z to CEILING_Z, thrust is blended proportionally from
 # hover down to near-zero. This gives a smooth slowdown rather than a hard cut.
 CEILING_WARN_Z = 0.85         # Brake warning threshold (70% of 1.2m)
+
+# ── Auto-landing (once camera locks) ──────────────────────────────────────────
+# After the first confident camera lock, target_z is frozen at the detected
+# height then steadily reduced at DESCEND_RATE m/s until LANDING_Z is reached,
+# at which point motors are cut via safe_descend().
+DESCEND_RATE = 0.06           # m/s — gentle descent speed
+LANDING_Z    = 0.15           # m  — cut motors when this low
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -303,15 +316,17 @@ def control_loop():
     tracked_id    = DRONE_MARKER_ID
 
     # Flight Phase state
-    flight_phase  = 'DISARMED' # DISARMED -> IDLE -> ACTIVE
+    flight_phase  = 'DISARMED' # DISARMED -> TAKING_OFF -> ACTIVE
+    takeoff_start_t = 0.0
     target_z      = -1.0
     baseline_yaw  = None
     home_x        = 0.0
     home_y        = 0.0
     curr_thrust   = 0
-    base_hover    = HOVER_SEARCH   # starts low, adapts up
-    adapt_avg     = 0.0            # EMA of PID thrust adj, used for base learning
-    esc_unlock_until = 0.0         # timestamp until which ESC unlock is running
+    base_hover    = cfg.HOVER_THRUST   # real hover baseline from config
+    adapt_avg     = 0.0
+    esc_unlock_until    = 0.0
+    launch_catch_until  = 0.0          # ACTIVE launch-catch phase end time
 
     scrcpy_proc, cam_hwnd = _open_scrcpy_camera()
     prev_armed = False
@@ -387,16 +402,15 @@ def control_loop():
 
                     last_det_t    = time.time()
                     detect_streak = min(detect_streak + 1, MIN_STREAK)
-                    # raw_detected: available after IDLE_STREAK frames (enough to confirm drone seen)
-                    # detected: only after MIN_STREAK frames (accurate pose for ACTIVE PIDs)
+                    # IDLE_STREAK frames) to spin props.
+                    # ACTIVE mode needs the full detected (MIN_STREAK frames) for accurate PIDs.
                     if detect_streak >= IDLE_STREAK:
                         raw_detected = smooth_pos
                     if detect_streak >= MIN_STREAK:
                         detected = smooth_pos
 
                     # ── Boundary check (pixel-level, ACTIVE only) ─────────
-                    # During IDLE the user is hand-holding and aligning the drone,
-                    # so being off-center is expected. Kill only in ACTIVE mode.
+                    # During TAKING_OFF we expect it to be uncentered. Kill only in ACTIVE.
                     pix_x, pix_y = int(pix[0]), int(pix[1])
                     outside_zone = not (bx < pix_x < bex and by < pix_y < bey)
                     if outside_zone and flight_phase == 'ACTIVE':
@@ -409,13 +423,14 @@ def control_loop():
                         flight_phase  = 'DISARMED'
                         smooth_pos    = None
                         detect_streak = 0
-                        curr_thrust   = 0
-                        prev_armed    = False
-                        tracked_id    = DRONE_MARKER_ID
-                        detected      = None  # skip ACTIVE logic below
+                        curr_thrust      = 0
+                        esc_unlock_until = time.time() + ESC_UNLOCK_SECS
+                        prev_armed       = False
+                        tracked_id       = DRONE_MARKER_ID
+                        detected         = None  # skip ACTIVE logic below
                     elif outside_zone:
-                        # IDLE — just warn on-screen, don't stop anything
-                        cv2.putText(frame, "ALIGN TO SAFE ZONE BEFORE RELEASE",
+                        # TAKING_OFF — just warn on-screen
+                        cv2.putText(frame, "ALIGN TO SAFE ZONE BEFORE TAKEOFF",
                                     (bx + 4, bey - 8), cv2.FONT_HERSHEY_SIMPLEX,
                                     0.45, (0, 0, 255), 1)
 
@@ -445,8 +460,9 @@ def control_loop():
             tracked_id    = DRONE_MARKER_ID
             smooth_pos    = None
             detect_streak = 0
-            curr_thrust   = 0
-            prev_armed    = False
+            curr_thrust      = 0
+            esc_unlock_until = time.time() + ESC_UNLOCK_SECS
+            prev_armed       = False
             with _lock:
                 _state['armed']     = False  # Force disarm
                 _state['emergency'] = False  # Auto-clear so ESC is a one-shot kill
@@ -480,65 +496,98 @@ def control_loop():
         prev_armed = True
 
         # ── Tracking lost handling ──────────────────────────────────────────────────────────
-        # IDLE mode only needs raw_detected (IDLE_STREAK frames) to spin props.
         # ACTIVE mode needs the full detected (MIN_STREAK frames) for accurate PIDs.
         if flight_phase == 'ACTIVE' and detected is None:
             print("[LOST] Tracking lost during ACTIVE flight. Safe descend.")
             reset_pids()
             threading.Thread(target=safe_descend, args=(curr_thrust,), daemon=True).start()
-            curr_thrust  = 0
-            flight_phase = 'DISARMED'
+            curr_thrust      = 0
+            esc_unlock_until = time.time() + ESC_UNLOCK_SECS
+            flight_phase     = 'DISARMED'
             with _lock: _state['armed'] = False
             prev_armed   = False
             tracked_id   = DRONE_MARKER_ID
             continue
 
-        if flight_phase in ('DISARMED', 'IDLE') and raw_detected is None:
-            # No marker visible at all — stay in disarmed (don't spin props yet)
-            _overlay(frame, "SEARCHING… point camera at ArUco marker", (100, 100, 255))
-            cv2.imshow("Ground Cam Flight Test", frame)
-            cv2.waitKey(1)
-            continue
-
-        # Pick the best available position: accurate if ACTIVE, loose if IDLE
+        # Pick the best available position: accurate if ACTIVE, loose if TAKING_OFF
         pose = detected if detected is not None else raw_detected
-        x_m, y_m, z_m, yaw_raw = pose
+        x_m, y_m, z_m, yaw_raw = pose if pose is not None else (0.0, 0.0, 0.0, 0.0)
 
         # Flight State Machine
         if flight_phase == 'DISARMED':
-            if z_m < HANDOVER_Z:
-                flight_phase = 'IDLE'
-                print(f"[IDLE] Armed. Props spinning slowly. Z={z_m:.2f}m")
-            else:
-                print(f"[WARN] Too high to arm safe-idle. Bring drone lower (< {HANDOVER_Z}m)")
-                with _lock: _state['armed'] = False
-                continue
+            # Blind launch — drone may or may not be in frame. Arm and ramp
+            # thrust unconditionally (same ramp-up as hover_gui). Camera will
+            # catch the drone mid-air and take over automatically.
+            flight_phase    = 'TAKING_OFF'
+            takeoff_start_t = time.time()
+            print("[TAKEOFF] Armed. Blind ramp started — searching for drone with camera...")
 
-        if flight_phase == 'IDLE':
-            curr_thrust = IDLE_THRUST
-            send_rpyt(0, 0, 0, curr_thrust)
-            # Show calibration progress if not yet at full MIN_STREAK
-            if detected is None:
-                streak_pct = int(detect_streak / MIN_STREAK * 100)
-                _overlay(frame, f"IDLE  Z≈{z_m:.2f}m  Calibrating pose ({streak_pct}%)  raise when 100%", (0, 165, 255))
+        if flight_phase == 'TAKING_OFF':
+            if time.time() < esc_unlock_until:
+                # MUST send 2.0s of zeros before ESC allows motors to spin
+                send_rpyt(0, 0, 0, 0)
+                takeoff_start_t = time.time()  # delay ramp start
+                remain = esc_unlock_until - time.time()
+                _overlay(frame, f"TAKEOFF — Unlocking ESC ({remain:.1f}s)", (0, 165, 255))
             else:
-                _overlay(frame, f"IDLE  Z={z_m:.2f}m  Raise above {HANDOVER_Z}m to fly", (0, 165, 255))
+                t_elapsed = time.time() - takeoff_start_t
+                ramp_frac = min(1.0, t_elapsed / TAKEOFF_RAMP_TIME)
+                curr_thrust = int(ramp_frac * TAKEOFF_MAX_THRUST)
+                send_rpyt(cfg.TRIM_ROLL, cfg.TRIM_PITCH, cfg.TRIM_YAW, curr_thrust)
+                
+                if pose is None:
+                    _overlay(frame, f"TAKING OFF (BLIND)  T:{curr_thrust}  Waiting for camera lock…", (0, 100, 255))
+                elif detected is None:
+                    streak_pct = int(detect_streak / MIN_STREAK * 100)
+                    _overlay(frame, f"TAKEOFF  Z≈{z_m:.2f}m  Calibrating ({streak_pct}%)  T:{curr_thrust}", (0, 165, 255))
+                else:
+                    _overlay(frame, f"TAKEOFF  Z={z_m:.2f}m  Camera locked — handing over…  T:{curr_thrust}", (0, 165, 255))
 
-            # CRITICAL: only handover when ACCURATE detected pose says Z >= threshold
-            # raw_detected (2-frame) can have noisy Z ≈ 0.40 even while below — don't use it
-            if detected is not None and z_m >= HANDOVER_Z:
+            # Hand over as soon as we have a confident camera lock — at any height.
+            # Freeze target_z at whatever the drone is right now; ACTIVE will
+            # descend from there automatically.
+            if detected is not None:
                 flight_phase = 'ACTIVE'
-                target_z     = z_m
+                target_z     = float(z_m)   # lock height, then descend from here
                 baseline_yaw = yaw_raw
-                home_x       = x_m
-                home_y       = y_m
+                home_x       = 0.0
+                home_y       = 0.0
                 reset_pids()
-                base_hover   = HOVER_SEARCH  # reset adaptive baseline on each handover
+                base_hover   = cfg.HOVER_THRUST
                 adapt_avg    = 0.0
-                curr_thrust  = HOVER_SEARCH
-                print(f"[ACTIVE] Handover complete! Target Z={target_z:.2f}m  Starting at base_hover={base_hover}")
+                curr_thrust  = LAUNCH_THRUST   # sub-hover to brake any upward momentum
+                launch_catch_until = time.time() + LAUNCH_SECS
+                print(f"[ACTIVE] Camera lock at Z={target_z:.2f}m  base_hover={base_hover}  CATCH {LAUNCH_SECS}s → auto-descend to {LANDING_Z}m")
 
         elif flight_phase == 'ACTIVE':
+            # ── LAUNCH CATCH phase ───────────────────────────────────────────────
+            # Immediately after takeoff handover, drone has upward momentum.
+            # Hold sub-hover thrust for LAUNCH_SECS to let gravity brake the climb.
+            # During this window, we do NOT constantly update target_z to peak anymore.
+            # target_z is firmly set to 0.40. PIDs will bring it down.
+            if time.time() < launch_catch_until:
+                catch_remaining = launch_catch_until - time.time()
+                curr_thrust = LAUNCH_THRUST
+                # Still output RPY corrections during catch so it centers quickly
+                dx = x_m - home_x
+                dy = y_m - home_y
+                tilt = (yaw_raw - baseline_yaw)
+                tilt = (tilt + 180) % 360 - 180
+                ex = dx if abs(dx) > DEAD_XY else 0.0
+                ey = dy if abs(dy) > DEAD_XY else 0.0
+                eyaw = tilt if abs(tilt) > DEAD_YAW else 0.0
+                cmd_roll  = pid_roll.compute(-ex)
+                cmd_pitch = pid_pitch.compute(ey)
+                cmd_yaw   = pid_yaw.compute(-eyaw)
+                
+                send_rpyt(cmd_roll + cfg.TRIM_ROLL, cmd_pitch + cfg.TRIM_PITCH, cmd_yaw + cfg.TRIM_YAW, curr_thrust)
+                _overlay(frame,
+                    f"CATCH  Z:{z_m:.2f}m  braking ({catch_remaining:.1f}s)  → will descend to {LANDING_Z}m",
+                    (0, 220, 255))
+                cv2.imshow("Ground Cam Flight Test", frame)
+                cv2.waitKey(1)
+                continue
+
             # ── Proportional Ceiling Brake Zone ─────────────────────────────────
             # TOP PRIORITY: prevent ceiling collision.
             # From CEILING_WARN_Z (0.85m) to CEILING_Z (1.2m) we blend thrust
@@ -547,8 +596,8 @@ def control_loop():
                 # How far into the brake zone? 0.0=entering, 1.0=at hard ceiling
                 frac = (z_m - CEILING_WARN_Z) / (CEILING_Z - CEILING_WARN_Z)
                 frac = min(1.0, max(0.0, frac))
-                # Ceiling thrust = IDLE at ceiling, IDLE_THRUST at warning
-                ceiling_thrust = int(IDLE_THRUST * (1.0 - frac) + 0 * frac)
+                # Ceiling thrust = 20k at ceiling, 35k at warning
+                ceiling_thrust = int(35000 * (1.0 - frac) + 20000 * frac)
                 curr_thrust    = ceiling_thrust
                 send_rpyt(0, 0, 0, curr_thrust)
                 col = (0, 100, 255) if frac < 0.5 else (0, 0, 255)
@@ -557,7 +606,10 @@ def control_loop():
                 cv2.waitKey(1)
                 continue
 
-            target_z = max(0.4, min(CEILING_Z - 0.05, target_z + tdelta))  # tdelta=±0.05m/keypress
+            # Auto-descend at DESCEND_RATE m/s. tdelta (Up/Down keys) can nudge
+            # the target height temporarily (useful for manual override).
+            target_z = max(LANDING_Z, min(CEILING_Z - 0.05,
+                           target_z - DESCEND_RATE / cfg.SEND_HZ + tdelta))
 
             dx = x_m - home_x
             dy = y_m - home_y
@@ -599,7 +651,19 @@ def control_loop():
                       cmd_yaw   + cfg.TRIM_YAW,
                       curr_thrust)
 
-            _overlay(frame, f"ACTIVE Z:{z_m:.2f}m Tgt:{target_z:.2f}m BaseHov:{base_hover} T:{curr_thrust}", (0, 255, 100))
+            # ── Auto-land when we've reached LANDING_Z ──────────────────────
+            if target_z <= LANDING_Z and z_m <= LANDING_Z + 0.12:
+                print(f"[LAND] Reached landing height Z={z_m:.2f}m — safe descend.")
+                threading.Thread(target=safe_descend, args=(curr_thrust,), daemon=True).start()
+                with _lock:
+                    _state['armed'] = False
+                curr_thrust      = 0
+                esc_unlock_until = time.time() + ESC_UNLOCK_SECS
+                flight_phase     = 'DISARMED'
+                prev_armed       = False
+                reset_pids()
+
+            _overlay(frame, f"ACTIVE Z:{z_m:.2f}m  Tgt:{target_z:.2f}m  BaseHov:{base_hover}  T:{curr_thrust}  ↓{DESCEND_RATE}m/s", (0, 255, 100))
             cv2.putText(frame, f"R:{cmd_roll:+.1f} P:{cmd_pitch:+.1f} Y:{cmd_yaw:+.1f}", (10, fh-45),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
@@ -612,10 +676,11 @@ def control_loop():
                 _state['emergency'] = False
             send_rpyt(0, 0, 0, 0)
             reset_pids()
-            flight_phase  = 'DISARMED'
-            curr_thrust   = 0
-            prev_armed    = False
-            tracked_id    = DRONE_MARKER_ID
+            flight_phase     = 'DISARMED'
+            curr_thrust      = 0
+            esc_unlock_until = time.time() + ESC_UNLOCK_SECS
+            prev_armed       = False
+            tracked_id       = DRONE_MARKER_ID
             print("[ESC] Motors killed.")
         # Q — quit the application entirely
         elif key in (ord('q'), ord('Q')):
@@ -658,8 +723,11 @@ def main():
     print("  7. SPACE again to softly drop.")
     print("=" * 60)
 
+    last_space_t = [0.0]
     def _kb_space():
-        with _lock: _state['armed'] = not _state['armed']
+        if time.time() - last_space_t[0] > 1.0:
+            with _lock: _state['armed'] = not _state['armed']
+            last_space_t[0] = time.time()
     def _kb_esc():
         with _lock: _state['emergency'] = not _state['emergency']
     def _kb_up():
