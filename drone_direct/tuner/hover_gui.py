@@ -971,30 +971,38 @@ class TunerWindow(QMainWindow):
         # Mode 2 RC:
         #   Left stick  (WASD)  —  W/S = throttle,    A/D = yaw
         #   Right stick (arrows)—  Up/Down = pitch,  Left/Right = roll
-        STEP_ATT       = 5.0    # degrees per 20 ms tick
-        STEP_YAW       = 15.0   # deg/s per tick
-        # Joystick-style throttle: starts slow, accelerates while held
+        # All axes: joystick hold-to-accelerate (tap = fine, hold = fast)
+        ATT_MIN_RATE   = 1.0    # degrees/tick on first press
+        ATT_MAX_RATE   = 12.0   # degrees/tick after 1.5 s hold
+        YAW_MIN_RATE   = 3.0    # deg-s/tick on first press
+        YAW_MAX_RATE   = 30.0   # deg-s/tick after 1.5 s hold
         THRUST_MIN_RATE = 50    # thrust/tick on first press  (fine trim)
         THRUST_MAX_RATE = 600   # thrust/tick after 1.5 s hold (fast climb)
-        THRUST_ACCEL_T  = 1.5   # seconds to reach max rate
+        ACCEL_T         = 1.5   # seconds to reach max rate (all axes)
 
         r = p = y = 0.0
         dt = 0
 
         now = time.time()
         for k in self._pressed:
-            if k == Qt.Key_Left:  r -= STEP_ATT
-            if k == Qt.Key_Right: r += STEP_ATT
-            if k == Qt.Key_Up:    p -= STEP_ATT   # forward = nose down
-            if k == Qt.Key_Down:  p += STEP_ATT
-            if k == Qt.Key_A:     y -= STEP_YAW
-            if k == Qt.Key_D:     y += STEP_YAW
-            if k in (Qt.Key_W, Qt.Key_S):
-                hold = now - self._key_hold_start.get(k, now)
-                ratio = min(1.0, hold / THRUST_ACCEL_T)
+            hold  = now - self._key_hold_start.get(k, now)
+            ratio = min(1.0, hold / ACCEL_T)
+
+            if k in (Qt.Key_Left, Qt.Key_Right):
+                step = ATT_MIN_RATE + ratio * (ATT_MAX_RATE - ATT_MIN_RATE)
+                r += step if k == Qt.Key_Right else -step
+
+            elif k in (Qt.Key_Up, Qt.Key_Down):
+                step = ATT_MIN_RATE + ratio * (ATT_MAX_RATE - ATT_MIN_RATE)
+                p += step if k == Qt.Key_Down else -step   # forward = nose down
+
+            elif k in (Qt.Key_A, Qt.Key_D):
+                step = YAW_MIN_RATE + ratio * (YAW_MAX_RATE - YAW_MIN_RATE)
+                y += step if k == Qt.Key_D else -step
+
+            elif k in (Qt.Key_W, Qt.Key_S):
                 step = int(THRUST_MIN_RATE + ratio * (THRUST_MAX_RATE - THRUST_MIN_RATE))
-                if k == Qt.Key_W: dt += step
-                else:             dt -= step
+                dt  += step if k == Qt.Key_W else -step
 
         if dt:
             new_t = max(cfg.THRUST_MIN,
