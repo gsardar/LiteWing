@@ -20,6 +20,7 @@ Drone panel (bottom):
   [EMG CONTROL]  [ARM]  [SOFT LAND]  [EMERGENCY STOP]   Thrust ±   Status badge
 """
 
+import importlib.util as _ilu
 import socket
 import struct
 import sys
@@ -30,7 +31,7 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget,
+    QApplication, QComboBox, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QGroupBox,
     QFrame, QScrollArea,
@@ -40,12 +41,25 @@ from PyQt5.QtGui import QFont
 from pylsl import StreamInlet, resolve_streams
 from scipy.signal import butter, filtfilt
 
-# ── Import drone config ───────────────────────────────────────────────────────
+# ── Drone config loader ───────────────────────────────────────────────────────
 _TUNER = Path(__file__).parent / 'tuner'
 sys.path.insert(0, str(_TUNER))
 
+_DRONE_CONFIGS = {
+    'Drone 2  (config three)': 'config three',
+    'Drone 1  (config 4)':     'config 4',
+}
+
+def _load_cfg(filename: str):
+    path = _TUNER / (filename + '.py')
+    spec = _ilu.spec_from_file_location('_active_drone_cfg', str(path))
+    assert spec is not None and spec.loader is not None, f"Cannot load config: {path}"
+    mod = _ilu.module_from_spec(spec)  # type: ignore[arg-type]
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod
+
 try:
-    import config as drone_cfg
+    drone_cfg = _load_cfg('config three')
     DRONE_AVAILABLE = True
 except Exception as _imp_err:
     DRONE_AVAILABLE = False
@@ -325,10 +339,11 @@ class DroneControlApp(QMainWindow):
         self.detectors = [ChannelDetector(), ChannelDetector()]
 
         # ── Drone state ────────────────────────────────────────────────────────
-        self._drone        = None
-        self._base_thrust  = (drone_cfg.HOVER_THRUST
-                              if DRONE_AVAILABLE else 39209)
-        self._emg_enabled  = False
+        self._drone         = None
+        self._cfg_filename  = 'config three'   # active drone config
+        self._base_thrust   = (drone_cfg.HOVER_THRUST
+                               if DRONE_AVAILABLE else 39209)
+        self._emg_enabled   = False
 
         self._init_ui()
         self._connect_lsl()
@@ -548,6 +563,19 @@ class DroneControlApp(QMainWindow):
         row = QHBoxLayout(grp)
         row.setSpacing(10)
 
+        # Drone selector
+        self.cmb_drone = QComboBox()
+        self.cmb_drone.addItems(list(_DRONE_CONFIGS.keys()))
+        self.cmb_drone.setFixedHeight(38)
+        self.cmb_drone.setMinimumWidth(210)
+        self.cmb_drone.setStyleSheet(
+            "background:#1e1e2e; color:#ddd; border:1px solid #333; "
+            "border-radius:4px; padding:2px 6px; font-size:11px;")
+        self.cmb_drone.currentTextChanged.connect(self._on_drone_select)
+        row.addWidget(self.cmb_drone)
+
+        row.addWidget(self._sep())
+
         # EMG CONTROL toggle
         self.btn_emg = QPushButton("EMG CONTROL: OFF")
         self.btn_emg.setFixedHeight(40)
@@ -641,6 +669,23 @@ class DroneControlApp(QMainWindow):
             "QGroupBox { border:1px solid #2a2a3e; border-radius:8px; "
             "margin-top:10px; padding:4px; font-size:10px; color:#555; }"
             "QGroupBox::title { subcontrol-origin:margin; left:10px; padding:0 3px; }")
+
+    # ── Drone selector ────────────────────────────────────────────────────────
+    def _on_drone_select(self, display_name: str):
+        global drone_cfg
+        filename = _DRONE_CONFIGS[display_name]
+        try:
+            drone_cfg = _load_cfg(filename)
+        except Exception as e:
+            self.lbl_drone_status.setText(f"Config error: {e}")
+            return
+        self._cfg_filename = filename
+        self._base_thrust  = drone_cfg.HOVER_THRUST
+        self.lbl_thrust.setText(f"Thrust: {self._base_thrust}")
+        if self._drone and self._drone.is_armed:
+            self._drone.set_params(
+                self._base_thrust,
+                drone_cfg.TRIM_ROLL, drone_cfg.TRIM_PITCH, drone_cfg.TRIM_YAW)
 
     # ── Drone button handlers ─────────────────────────────────────────────────
     def _on_emg_toggle(self):

@@ -44,9 +44,8 @@ _DRONE_CONFIGS = {
 def _load_config_file(filename: str):
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename + '.py')
     spec = importlib.util.spec_from_file_location('_active_drone_cfg', path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load config: {path}")
-    mod = importlib.util.module_from_spec(spec)
+    assert spec is not None and spec.loader is not None, f"Cannot load config: {path}"
+    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
     return mod
 
@@ -729,6 +728,7 @@ class TunerWindow(QMainWindow):
         self._poll.timeout.connect(self._refresh)
         self._poll.start(120)
 
+        self._cfg_filename = 'config three'   # tracks currently loaded drone config
         self._cfg_mtime = self._get_mtime()
         self._hot = QTimer()
         self._hot.timeout.connect(self._hot_reload)
@@ -759,13 +759,30 @@ class TunerWindow(QMainWindow):
         h = QLabel("Hover Tuner")
         h.setFont(QFont('Segoe UI', 18, QFont.Bold))
         h.setStyleSheet('color:#fff;')
-        sub = QLabel(
+        self.sub = QLabel(
             f"{cfg.DRONE_IP}:{cfg.DRONE_PORT}  ·  "
             "ARM  →  tune Throttle until drone lifts  →  fix hardware drift "
             "with Trim sliders  →  Save")
-        sub.setStyleSheet('color:#444; font-size:10px;')
+        self.sub.setStyleSheet('color:#444; font-size:10px;')
         v.addWidget(h)
-        v.addWidget(sub)
+
+        # Drone selector
+        sel_row = QHBoxLayout()
+        sel_lbl = QLabel("Drone:")
+        sel_lbl.setStyleSheet('color:#888; font-size:11px;')
+        self.cmb_drone = QComboBox()
+        self.cmb_drone.addItems(list(_DRONE_CONFIGS.keys()))
+        self.cmb_drone.setFixedHeight(28)
+        self.cmb_drone.setMinimumWidth(220)
+        self.cmb_drone.setStyleSheet(
+            'background:#1e1e2e; color:#ddd; border:1px solid #333; '
+            'border-radius:4px; padding:2px 6px; font-size:11px;')
+        self.cmb_drone.currentTextChanged.connect(self._on_drone_select)
+        sel_row.addWidget(sel_lbl)
+        sel_row.addWidget(self.cmb_drone)
+        sel_row.addStretch()
+        sel_row.addWidget(self.sub)
+        v.addLayout(sel_row)
 
         # ── Sliders — Mode 2 RC layout ────────────────────────────────────
         sticks = QHBoxLayout()
@@ -987,10 +1004,32 @@ class TunerWindow(QMainWindow):
 
         self.drone.set_key_offsets(r, p, y)
 
+    # ── Drone selector ────────────────────────────────────────────────────
+    def _on_drone_select(self, display_name: str):
+        global cfg
+        filename = _DRONE_CONFIGS[display_name]
+        try:
+            cfg = _load_config_file(filename)
+        except Exception as e:
+            self.status.setText(f"Config load error: {e}")
+            return
+        self._cfg_filename = filename
+        self._cfg_mtime = self._get_mtime()
+        self.sub.setText(
+            f"{cfg.DRONE_IP}:{cfg.DRONE_PORT}  ·  "
+            "ARM  →  tune Throttle until drone lifts  →  fix hardware drift "
+            "with Trim sliders  →  Save")
+        self.sl_thrust.set_value(cfg.HOVER_THRUST)
+        self.sl_roll.set_value(cfg.TRIM_ROLL)
+        self.sl_pitch.set_value(cfg.TRIM_PITCH)
+        self.sl_yaw.set_value(cfg.TRIM_YAW)
+        self._push()
+        self.status.setText(f"Loaded {display_name}")
+
     # ── Save / reload ─────────────────────────────────────────────────────
     def _save(self):
         import re
-        path = os.path.join(os.path.dirname(__file__), 'config.py')
+        path = os.path.join(os.path.dirname(__file__), self._cfg_filename + '.py')
         with open(path, encoding='utf-8') as f:
             text = f.read()
         vals = {
@@ -1013,7 +1052,7 @@ class TunerWindow(QMainWindow):
     def _get_mtime(self):
         try:
             return os.path.getmtime(
-                os.path.join(os.path.dirname(__file__), 'config.py'))
+                os.path.join(os.path.dirname(__file__), self._cfg_filename + '.py'))
         except Exception:
             return 0
 
@@ -1023,14 +1062,14 @@ class TunerWindow(QMainWindow):
             return
         self._cfg_mtime = mt
         try:
-            import importlib, config as _c
-            importlib.reload(_c)
-            self.sl_thrust.set_value(_c.HOVER_THRUST)
-            self.sl_roll.set_value(_c.TRIM_ROLL)
-            self.sl_pitch.set_value(_c.TRIM_PITCH)
-            self.sl_yaw.set_value(_c.TRIM_YAW)
+            global cfg
+            cfg = _load_config_file(self._cfg_filename)
+            self.sl_thrust.set_value(cfg.HOVER_THRUST)
+            self.sl_roll.set_value(cfg.TRIM_ROLL)
+            self.sl_pitch.set_value(cfg.TRIM_PITCH)
+            self.sl_yaw.set_value(cfg.TRIM_YAW)
             self._push()
-            self.status.setText("config.py reloaded")
+            self.status.setText(f"{self._cfg_filename}.py reloaded")
         except Exception as e:
             self.status.setText(f"Reload error: {e}")
 
